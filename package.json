@@ -7,6 +7,7 @@
     "packages/*"
   ],
   "scripts": {
+    "bootstrap": "pnpm pack:service && pnpm install",
     "pack:service": "pnpm -C packages/service pack --pack-destination ../../vendor",
     "repro:rspack": "pnpm --filter repro-app run dev:rspack",
     "repro:webpack": "pnpm --filter repro-app run dev:webpack",
