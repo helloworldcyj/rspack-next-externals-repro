@@ -1,2 +1,83 @@
-# rspack-next-externals-repro
-rspack-next-externals-repro
+# Minimal reproduction of rspack `NextExternalsPlugin` misjudging transpilePackages on Windows + pnpm
+
+## Bug Overview
+
+- Environment: **Windows** + **pnpm** (junctions inside `node_modules`) + **Next.js 16.3.0** + **next-rspack 16.3.0** (`NEXT_RSPACK=true`) + pages router
+- Configuration: `transpilePackages: ['@demo/di-core', '@demo/service']`, with `bundlePagesRouterDependencies` **not enabled** (Next 16 defaults to `false`)
+- Expected: both transpile packages are bundled into the pages router server bundle (this is what happens in webpack mode)
+- Actual (**`next dev` only; `next build` works correctly**): the app's direct dependencies (packages with a junction under `<project>/node_modules` and located in the `.pnpm` virtual store, e.g. `@demo/service`) are **externalized** (runtime `require`); while packages that can only be resolved up to the workspace root (e.g. `@demo/di-core`) get bundled. The same `transpilePackages` list is treated inconsistently.
+
+## Runtime Consequences
+
+`@demo/di-core` is bundled, `@demo/service` is externalized → two instances of `@demo/di-core` coexist in the same Node process:
+
+- The `Symbol('Config')` obtained by the page code (inside the bundle) = symbol A
+- The `@demo/di-core` required internally by `@demo/service` (via Node require) = second instance, whose `Symbol('Config')` = symbol B
+
+A ≠ B → DI container resolution fails:
+
+```
+No matching bindings found for serviceIdentifier: Symbol(Config)
+```
+
+In the real business this is `@ad/anq` (`Symbol('ConfigProvider')`) reporting
+`No matching bindings found for serviceIdentifier: Symbol(ConfigProvider)` under Next.js 16 + rspack dev SSR.
+
+## Reproduction Steps
+
+```bash
+pnpm install
+
+# ① rspack dev (bug scene)
+pnpm repro:rspack
+# Open http://localhost:3100
+# The page shows: SSR resolve result: FAILED: No matching bindings found for serviceIdentifier: Symbol(Config)
+
+# ② webpack dev (control group, behaves correctly)
+pnpm repro:webpack
+# The page shows: SSR resolve result: OK, answer = 42
+
+# ③ rspack production build (also works fine, which shows the issue is dev-mode specific)
+pnpm build:rspack
+```
+
+## dev Build Output Differences
+
+After an rspack dev build, inspect `packages/app/.next/dev/server/pages/index.js`:
+
+```js
+// @demo/service is misjudged as external (even though it is in transpilePackages):
+"@demo/service"(module) {
+  module.exports = require("@demo/service");
+}
+// Meanwhile, in the same chunk, the source code of @demo/di-core is inlined (Symbol('Config') appears directly in the bundle)
+```
+
+In a webpack dev build both are inlined with no externals; in an rspack production build (`next build`) both are also correctly inlined.
+
+## Directory Structure (how the real dependency layout is simulated)
+
+| Role | Simulates | Installation form |
+| --- | --- | --- |
+| `packages/di-core` (workspace package) | `@ad/anq` | Declared only by the workspace root `package.json`, not a direct dependency of app → resolved up to the root |
+| `vendor/demo-service-1.0.0.tgz` → `@demo/service` | `@ad/redux-store` | A **direct dependency** of app, installed from a `file:` tarball into the `.pnpm` virtual store (junction link), and referencing di-core via **peerDependencies** (same as the real scenario) |
+
+> Key point: `@demo/service` must be installed in registry/tarball form (into `.pnpm`, with a junction inside `node_modules`); a direct workspace link (symlink to the source directory) will not trigger this bug — in that case path resolution happens to be consistent. `pnpm pack:service` can repackage it.
+
+## Root Cause Analysis
+
+rspack's `NextExternalsPlugin` (a Rust native plugin inside `@next/rspack-binding`) is responsible for externals decisions on the pages router server side. It internally maintains a mapping of transpile package directories (`resolved_external_package_dirs`, obtained by resolving `<pkg>/package.json` package by package from the project directory) and does prefix matching against resource paths:
+
+- On Windows + pnpm, `<project>/node_modules/@demo/service` is a **junction**; the mapped directory and the rspack resource path (`resolve.symlinks: true` → realpath, like `node_modules/.pnpm/@demo+service@file+.../node_modules/@demo/service`) resolve inconsistently, the prefix match fails → misjudged as "not a transpile package" → externalized
+- `@demo/di-core` does not exist in the project's `node_modules`, so the mapping resolution fails/misses → falls back to substring matching (the resource realpath contains `node_modules/@demo/di-core/`) → judged as bundled
+
+The JS implementation shipped with Next.js, `handle-externals.js` (used in webpack mode), does not have this problem — its `NODE_RESOLVE_OPTIONS.symlinks: true` applies consistent realpath handling to both the mapped directories and resource paths, so the two always match.
+
+## Environment Requirements
+
+- Windows (pnpm uses junctions; the symlink scenario on Linux/macOS is unverified)
+- pnpm workspace, Node 20+, Next.js 16.3.0, next-rspack 16.3.0
+
+## Workaround on the Business Side
+
+Use `Symbol.for()` (globally registered symbols) instead of `Symbol()` at the DI identifier level, so that identifiers remain identical across module instances. This keeps behavior consistent under mixed external/bundle loading (`@ad/anq` has already been fixed with this approach).
