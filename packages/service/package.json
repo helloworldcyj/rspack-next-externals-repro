@@ -8,6 +8,6 @@
     "@demo/di-core": "*"
   },
   "devDependencies": {
-    "@demo/di-core": "workspace:*"
+    "@demo/di-core": "1.0.0"
   }
 }
